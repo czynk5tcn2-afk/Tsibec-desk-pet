@@ -12,7 +12,7 @@
 
 ## 文件
 
-- `Sources/main.swift`：全部逻辑。主要类：`Pet`（窗口、动画、互动、菜单）、`QuotaWatcher`（quota-log 插件的 CSV 表格）、`CodexWatcher`（Codex 额度）、`FolderWatcher`（通用额度文件夹）、`BubbleView`（气泡）。
+- `Sources/main.swift`：全部逻辑。主要类：`Pet`（窗口、动画、互动、菜单）、`QuotaWatcher`（quota-log 插件的 CSV 表格）、`CodexWatcher`（Codex 额度）、`FolderWatcher`（通用额度文件夹，也读 Claude Usage Tracker 的缓存）、`LiveFetcher`（每 5 分钟主动查询 Codex / Claude，结果写进 `~/.pet-quota/`）、`BubbleView`（气泡）。
 - `Resources/frames/`：8 张透明 PNG 立绘，`day_` / `night_` × `idle`（睁眼）`blink`（闭眼笑）`read`（看书）`hold`（抱着要换的衣服）。8 张必须同尺寸、脚底对齐。
 - `tools/cutout.py`：把白底立绘抠成透明（需要 Pillow、numpy、scipy）。
 - `extras/claude-statusline.sh`：Claude Code 状态栏脚本，把官方 `rate_limits` 写成 `~/.pet-quota/claude.json`。
@@ -21,10 +21,13 @@
 
 ## 额度来源
 
-- **Codex**：读 `~/.codex/sessions/年/月/日/rollout-*.jsonl` 里最新一条 `token_count` 事件的 `rate_limits`（primary = 5 小时、secondary = 每周，`resets_at` 是秒级时间戳）。只看最近 4 天里最新的那份、只读文件最后 256KB。
+- **Codex 实时查询**（`LiveFetcher`，开关 `liveCodex`，默认开）：每 5 分钟运行本机 `codex app-server`，走 JSON-RPC 发 `initialize`、`initialized`、`account/rateLimits/read`，结果写成 `~/.pet-quota/codex.json`。不耗额度、不碰登录信息。15 分钟内有查询结果时，不再按对话记录重复提醒。
+- **Codex 对话记录**：读 `~/.codex/sessions/年/月/日/rollout-*.jsonl` 里最新一条 `token_count` 事件的 `rate_limits`（primary = 5 小时、secondary = 每周，`resets_at` 是秒级时间戳）。只看最近 4 天里最新的那份、只读文件最后 256KB。
+- **Claude Usage Tracker**（第三方开源 Mac 应用）：开了它的 Statusline 功能后会写 `~/.claude/.statusline-usage-cache`（`UTILIZATION`、`RESETS_AT`、`WEEKLY_UTILIZATION`、`WEEKLY_RESETS_AT`、`TIMESTAMP`），`FolderWatcher.readTracker()` 读它，15 分钟没更新就不算。
+- **Claude 实时查询**（开关 `liveClaude`，**默认关**）：读 Claude Code 登录信息（钥匙串 `Claude Code-credentials` 或 `~/.claude/.credentials.json`），调没公开文档的 `api.anthropic.com/api/oauth/usage`，结果写成 `~/.pet-quota/claude.json`。登录信息过期不替它刷新，只提示用户打开 Claude Code。
 - **通用文件夹** `~/.pet-quota/*.json`：格式见 `docs/额度来源.md`。叫 `Claude` 且 6 小时内更新过的文件，优先于 quota-log 的 CSV。
 - **quota-log 的 CSV**：默认路径 `~/Documents/forai/额度记录.csv`，可以 `defaults write com.emma.kaoruko-pet csvPath <路径>` 改。没有这个插件的话忽略即可。
-- 只读本机文件。不要加任何读取登录凭证、调用非公开接口或联网上传的代码。
+- 除了上面默认关着的 Claude 实时查询，不要再加读取登录凭证、调用非公开接口或上传数据的代码；新功能要读凭证的，一律默认关、菜单里写明。
 
 ## 调试（不用截屏权限）
 
@@ -32,7 +35,7 @@
 
 1. `defaults write com.emma.kaoruko-pet debug -bool true`，然后 `pkill -x Kaoruko; open ~/Applications/薰子.app`（刚装完第一次启动要等几秒）。
 2. 往 `~/Library/Caches/kaoruko/cmd` 写一行或多行动作名，一秒内依次执行。下一批命令至少隔 1.5 秒，不然会覆盖。
-   - 动作：`greet` `pat` `cake` `read` `nap` `day` `night` `quota` `chat` `study` `studydone` `autonap` `fakequota` `hop` `spin` `fidget` `petal` `twinkle` `swing` `codexpoll` `folderpoll`
+   - 动作：`greet` `pat` `cake` `read` `nap` `day` `night` `quota` `chat` `study` `studydone` `autonap` `fakequota` `hop` `spin` `fidget` `petal` `twinkle` `swing` `codexpoll` `folderpoll` `livepoll`
    - `snap:<名字>`：把窗口画成 `~/Library/Caches/kaoruko/<名字>.png`（深色底），同时写 `.txt` 记录窗口位置、是否穿透点击、衣服、状态、Codex 读数。`snap:<名字>@0.3` 是 0.3 秒后再拍，用来抓动画中间那一帧。
 3. 测完：`defaults delete com.emma.kaoruko-pet debug`、`defaults delete com.emma.kaoruko-pet studyLog`，重启她。手动换过装的话再发一次 `day` 或 `night`。
 

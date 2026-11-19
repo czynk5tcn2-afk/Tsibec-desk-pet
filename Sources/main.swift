@@ -40,6 +40,9 @@ final class Prefs {
     /// 省电：关掉头发裙摆的风、身体轻晃、花瓣星星和小动作
     static var lowMotion: Bool { get { d.bool(forKey: "lowMotion") } set { d.set(newValue, forKey: "lowMotion") } }
     static var useClaude: Bool { get { d.object(forKey: "useClaude") as? Bool ?? true } set { d.set(newValue, forKey: "useClaude") } }
+    /// 主动查询：Claude 要读本机登录凭证，默认关；Codex 用它自带的本地接口，默认开
+    static var liveClaude: Bool { get { d.bool(forKey: "liveClaude") } set { d.set(newValue, forKey: "liveClaude") } }
+    static var liveCodex: Bool { get { d.object(forKey: "liveCodex") as? Bool ?? true } set { d.set(newValue, forKey: "liveCodex") } }
     static var useCodex: Bool { get { d.object(forKey: "useCodex") as? Bool ?? true } set { d.set(newValue, forKey: "useCodex") } }
     /// 额度文件夹里被关掉的来源（按 name）
     static var mutedSources: [String] { get { d.stringArray(forKey: "mutedSources") ?? [] } set { d.set(newValue, forKey: "mutedSources") } }
@@ -231,16 +234,57 @@ final class FolderWatcher {
     private var mtimes: [String: Date] = [:]
     var onChange: (([(QuotaRow, Double?)]) -> Void)?
 
-    /// 名字叫 Claude、并且 6 小时内更新过的文件（状态栏脚本写的）
-    var freshClaude: SourceFile? {
-        sources.values.first { $0.name.lowercased() == "claude" && Date().timeIntervalSince($0.updatedAt ?? .distantPast) < 6 * 3600 }
+    /// 名字叫 Claude、并且 6 小时内更新过的文件（主动查询或状态栏脚本写的）
+    var freshClaude: SourceFile? { fresh("claude", within: 6 * 3600) }
+    /// 主动查询写的 Codex 文件；15 分钟内更新过才算数，否则退回读 Codex 的对话记录
+    var freshCodex: SourceFile? { fresh("codex", within: 15 * 60) }
+    func fresh(_ name: String, within: TimeInterval) -> SourceFile? {
+        sources.values.first { $0.name.lowercased() == name && Date().timeIntervalSince($0.updatedAt ?? .distantPast) < within }
+    }
+
+    /// 前后两次比，每个窗口变了就记一条
+    static func compare(_ old: SourceFile, _ new: SourceFile) -> [(QuotaRow, Double?)] {
+        new.windows.compactMap { n in
+            guard let o = old.windows.first(where: { $0.label == n.label }) else { return nil }
+            let moved = (n.resetsAt?.timeIntervalSince1970 ?? 0) - (o.resetsAt?.timeIntervalSince1970 ?? 0) > 600
+            let delta = n.used - o.used
+            if delta == 0 && !moved { return nil }
+            return (QuotaRow(time: "", kind: new.name + "·" + n.label, used: n.used,
+                             change: delta > 0 ? "+" + pct(delta) : pct(delta),
+                             isReset: delta < 0 || moved, reset: ""), o.used)
+        }
+    }
+
+    /// 读 Claude Usage Tracker 的缓存；超过 15 分钟没更新（它没在跑）就不算
+    static func readTracker() -> SourceFile? {
+        guard let text = try? String(contentsOfFile: NSHomeDirectory() + "/.claude/.statusline-usage-cache", encoding: .utf8) else { return nil }
+        var kv: [String: String] = [:]
+        for line in text.split(whereSeparator: \.isNewline) {
+            let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
+            if parts.count == 2 { kv[parts[0]] = parts[1] }
+        }
+        guard let ts = kv["TIMESTAMP"].flatMap(Double.init), Date().timeIntervalSince1970 - ts < 15 * 60 else { return nil }
+        var windows: [SourceWindow] = []
+        for (u, r, label) in [("UTILIZATION", "RESETS_AT", "5 小时"), ("WEEKLY_UTILIZATION", "WEEKLY_RESETS_AT", "每周")] {
+            guard let used = kv[u].flatMap(Double.init) else { continue }
+            windows.append(SourceWindow(label: label, used: used,
+                                        resetsAt: LiveFetcher.epoch(kv[r]).map { Date(timeIntervalSince1970: $0) }))
+        }
+        return windows.isEmpty ? nil : SourceFile(name: "Claude", updatedAt: Date(timeIntervalSince1970: ts), windows: windows)
     }
 
     func poll(force: Bool = false) {
         let fm = FileManager.default
         let names = ((try? fm.contentsOfDirectory(atPath: Self.dir)) ?? []).filter { $0.hasSuffix(".json") && !$0.hasPrefix(".") }
-        for gone in Set(sources.keys).subtracting(names) { sources[gone] = nil; mtimes[gone] = nil }
+        for gone in Set(sources.keys).subtracting(names) where !gone.hasPrefix("@") { sources[gone] = nil; mtimes[gone] = nil }
         var changes: [(QuotaRow, Double?)] = []
+        // Claude Usage Tracker（第三方 Mac 应用）开了状态栏功能后，每次刷新会写 ~/.claude/.statusline-usage-cache，
+        // 只有几行数字（不含登录信息）。读它，当成一个叫 Claude 的来源
+        let trackerKey = "@claude-usage-tracker"
+        if let t = Self.readTracker() {
+            if let old = sources[trackerKey] { changes += Self.compare(old, t) }
+            sources[trackerKey] = t
+        } else { sources[trackerKey] = nil }
         for file in names.sorted() {
             let path = Self.dir + "/" + file
             let m = (try? fm.attributesOfItem(atPath: path))?[.modificationDate] as? Date
@@ -257,23 +301,175 @@ final class FolderWatcher {
             }
             let new = SourceFile(name: name, updatedAt: (obj["updated_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) },
                                  windows: windows)
-            if let old = sources[file] {
-                for n in windows {
-                    guard let o = old.windows.first(where: { $0.label == n.label }) else { continue }
-                    let moved = (n.resetsAt?.timeIntervalSince1970 ?? 0) - (o.resetsAt?.timeIntervalSince1970 ?? 0) > 600
-                    let delta = n.used - o.used
-                    if delta == 0 && !moved { continue }
-                    changes.append((QuotaRow(time: "", kind: name + "·" + n.label, used: n.used,
-                                             change: delta > 0 ? "+" + pct(delta) : pct(delta),
-                                             isReset: delta < 0 || moved, reset: ""), o.used))
-                }
-            }
+            if let old = sources[file] { changes += Self.compare(old, new) }
             sources[file] = new
         }
         let muted = Set(Prefs.mutedSources)
         changes.removeAll { muted.contains(String($0.0.kind.split(separator: "·").first ?? "")) }
         if !changes.isEmpty { onChange?(changes) }
     }
+}
+
+// MARK: - 主动查询（每 5 分钟），结果写进 ~/.pet-quota/，由 FolderWatcher 发现变化
+// Claude：和 Claude Code 里 /usage 用的同一个接口（api.anthropic.com/api/oauth/usage，没有公开文档，
+//         官方改了就会失效，到时候再重做）。登录凭证从钥匙串或 ~/.claude/.credentials.json 读，
+//         只在内存里用这一下，不保存、不写文件、不打日志；过期了不替它刷新（免得把 Claude Code 挤下线）。
+// Codex：ChatGPT 应用自带的 codex 命令有官方本地接口 app-server，问 account/rateLimits/read，不耗额度，登录由 Codex 自己管。
+
+final class LiveFetcher {
+    private(set) var claudeNote: String?       // 查不到时的原因，给“看看额度”用
+    private(set) var codexNote: String?
+    private var lastClaude = Date.distantPast, lastCodex = Date.distantPast
+    private var claudeWaitUntil = Date.distantPast
+    private let queue = DispatchQueue(label: "kaoruko.live-quota")
+    var onWrite: (() -> Void)?                 // 写完文件后让 FolderWatcher 马上看一眼
+
+    func poll(force: Bool = false) {
+        let now = Date(), gap: TimeInterval = force ? 60 : 300
+        if Prefs.useClaude && Prefs.liveClaude && now.timeIntervalSince(lastClaude) >= gap && now >= claudeWaitUntil {
+            lastClaude = now; queue.async { self.fetchClaude() }
+        }
+        if Prefs.useCodex && Prefs.liveCodex && now.timeIntervalSince(lastCodex) >= gap {
+            lastCodex = now; queue.async { self.fetchCodex() }
+        }
+    }
+
+    // MARK: Claude
+
+    private func claudeToken() -> (token: String?, note: String?) {
+        var raw: String?
+        // 用系统自带的 security 命令读钥匙串：第一次会弹窗问你，点“始终允许”以后重新编译也不用再点
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        let out = Pipe(); p.standardOutput = out; p.standardError = Pipe()
+        if (try? p.run()) != nil {
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            if p.terminationStatus == 0 { raw = String(data: data, encoding: .utf8) }
+        }
+        if raw == nil { raw = try? String(contentsOfFile: NSHomeDirectory() + "/.claude/.credentials.json", encoding: .utf8) }
+        guard let raw, let obj = try? JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any],
+              let oauth = obj["claudeAiOauth"] as? [String: Any], let token = oauth["accessToken"] as? String else {
+            return (nil, "没找到 Claude Code 的登录信息（要在这台电脑上登录过 Claude Code）")
+        }
+        if let exp = (oauth["expiresAt"] as? NSNumber)?.doubleValue, exp / 1000 < Date().timeIntervalSince1970 {
+            return (nil, "Claude 登录信息过期了，打开 Claude Code 用一下就会自己更新")
+        }
+        return (token, nil)
+    }
+
+    private func fetchClaude() {
+        let (token, note) = claudeToken()
+        guard let token else { setNote(claude: note); return }
+        var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
+        req.timeoutInterval = 15
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        URLSession.shared.dataTask(with: req) { data, resp, _ in
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            guard code == 200, let data, let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                if code == 429 { DispatchQueue.main.async { self.claudeWaitUntil = Date().addingTimeInterval(900) } }
+                self.setNote(claude: code == 401 || code == 403 ? "Claude 登录信息失效了，打开 Claude Code 用一下就好"
+                                    : code == 0 ? "暂时连不上 Claude，稍后再试" : "Claude 用量接口返回了 \(code)，可能官方改了")
+                return
+            }
+            var windows: [[String: Any]] = []
+            for (key, label) in [("five_hour", "5 小时"), ("seven_day", "每周")] {
+                guard let w = obj[key] as? [String: Any], let used = (w["utilization"] as? NSNumber)?.doubleValue else { continue }
+                var row: [String: Any] = ["label": label, "used_percent": used]
+                if let r = Self.epoch(w["resets_at"]) { row["resets_at"] = r }
+                windows.append(row)
+            }
+            guard !windows.isEmpty else { self.setNote(claude: "Claude 用量接口没给出 5 小时 / 每周的数字"); return }
+            self.write("claude", name: "Claude", windows: windows)
+            self.setNote(claude: nil)
+        }.resume()
+    }
+
+    // MARK: Codex
+
+    private func codexBinary() -> String? {
+        let fm = FileManager.default
+        let candidates = ["/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+                          "/Applications/Codex.app/Contents/Resources/codex",
+                          "/opt/homebrew/bin/codex", "/usr/local/bin/codex", NSHomeDirectory() + "/.local/bin/codex"]
+        return candidates.first { fm.isExecutableFile(atPath: $0) }
+    }
+
+    private func fetchCodex() {
+        guard let bin = codexBinary() else { setNote(codex: nil); return }   // 没装就继续读对话记录，不算错
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: bin)
+        p.arguments = ["app-server"]
+        let inPipe = Pipe(), outPipe = Pipe()
+        p.standardInput = inPipe; p.standardOutput = outPipe; p.standardError = Pipe()
+        guard (try? p.run()) != nil else { return }
+        let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 20, execute: killer)
+        defer { killer.cancel(); if p.isRunning { p.terminate() } }
+        let msgs = [#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"kaoruko-pet","version":"1"}}}"#,
+                    #"{"method":"initialized"}"#,
+                    #"{"id":2,"method":"account/rateLimits/read","params":null}"#]
+        inPipe.fileHandleForWriting.write((msgs.joined(separator: "\n") + "\n").data(using: .utf8)!)
+        var buffer = Data()
+        while true {
+            let chunk = outPipe.fileHandleForReading.availableData
+            if chunk.isEmpty { break }                     // 进程结束或被 20 秒超时关掉
+            buffer.append(chunk)
+            while let nl = buffer.firstIndex(of: 0x0A) {
+                let line = buffer[..<nl]; buffer = buffer[(nl + 1)...]
+                guard let obj = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                      (obj["id"] as? NSNumber)?.intValue == 2 else { continue }
+                guard let result = obj["result"] as? [String: Any], let rl = result["rateLimits"] as? [String: Any] else {
+                    setNote(codex: "Codex 没给出额度（可能没登录）"); return
+                }
+                var windows: [[String: Any]] = []
+                for key in ["primary", "secondary"] {
+                    guard let w = rl[key] as? [String: Any], let used = (w["usedPercent"] as? NSNumber)?.doubleValue else { continue }
+                    let mins = (w["windowDurationMins"] as? NSNumber)?.intValue ?? 0
+                    let label = mins == 300 ? "5 小时" : mins == 10080 ? "每周" : "\(mins / 60) 小时"
+                    var row: [String: Any] = ["label": label, "used_percent": used]
+                    if let r = Self.epoch(w["resetsAt"]) { row["resets_at"] = r }
+                    windows.append(row)
+                }
+                if !windows.isEmpty { write("codex", name: "Codex", windows: windows) }
+                setNote(codex: nil)
+                return
+            }
+        }
+    }
+
+    // MARK: 共用
+
+    static func epoch(_ v: Any?) -> Double? {
+        if let n = v as? NSNumber { let d = n.doubleValue; return d > 1e12 ? d / 1000 : d }
+        if let s = v as? String {
+            let f = ISO8601DateFormatter()
+            f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let d = f.date(from: s) { return d.timeIntervalSince1970 }
+            f.formatOptions = [.withInternetDateTime]
+            return f.date(from: s)?.timeIntervalSince1970
+        }
+        return nil
+    }
+
+    private func write(_ file: String, name: String, windows: [[String: Any]]) {
+        let dir = FolderWatcher.dir
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let obj: [String: Any] = ["name": name, "updated_at": Int(Date().timeIntervalSince1970), "windows": windows,
+                                  "source": "薰子主动查询"]
+        guard let data = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]) else { return }
+        let tmp = dir + "/." + file + ".tmp", final = dir + "/" + file + ".json"
+        guard FileManager.default.createFile(atPath: tmp, contents: data) else { return }
+        _ = try? FileManager.default.replaceItemAt(URL(fileURLWithPath: final), withItemAt: URL(fileURLWithPath: tmp))
+        if FileManager.default.fileExists(atPath: tmp) { try? FileManager.default.moveItem(atPath: tmp, toPath: final) }
+        DispatchQueue.main.async { self.onWrite?() }
+    }
+
+    private func setNote(claude: String?) { DispatchQueue.main.async { self.claudeNote = claude } }
+    private func setNote(codex: String?) { DispatchQueue.main.async { self.codexNote = codex } }
 }
 
 func kindName(_ k: String) -> String {
@@ -490,6 +686,7 @@ final class Pet: NSObject {
     let quota = QuotaWatcher()
     let codex = CodexWatcher()
     let folder = FolderWatcher()
+    let live = LiveFetcher()
 
     var outfit: Outfit = .day
     var mode: Mode = .idle
@@ -556,16 +753,25 @@ final class Pet: NSObject {
         }
         folder.onChange = { [weak self] rows in
             guard let self else { return }
-            self.quotaChanged(rows.filter { !$0.0.kind.lowercased().hasPrefix("claude·") || Prefs.useClaude })
+            self.quotaChanged(rows.filter {
+                let k = $0.0.kind.lowercased()
+                return (!k.hasPrefix("claude·") || Prefs.useClaude) && (!k.hasPrefix("codex·") || Prefs.useCodex)
+            })
         }
         folder.poll()
         quota.poll()
-        codex.onChange = { [weak self] rows in self?.quotaChanged(rows) }
+        // 主动查询成功时，Codex 以查询结果为准，不再按对话记录重复提醒
+        codex.onChange = { [weak self] rows in
+            guard let self, self.folder.freshCodex == nil else { return }
+            self.quotaChanged(rows)
+        }
         codex.poll()
+        live.onWrite = { [weak self] in self?.folder.poll() }
+        live.poll()
 
         // 鼠标在她身上才接收点击，其余透明处直接点到下面的软件
         trackLoop()
-        Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in self?.folder.poll(); self?.quota.poll(); self?.codex.poll() }
+        Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in self?.live.poll(); self?.folder.poll(); self?.quota.poll(); self?.codex.poll() }
         Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in self?.tick() }
         scheduleBlink()
         scheduleAmbient()
@@ -1468,6 +1674,7 @@ final class Pet: NSObject {
     }
 
     func showQuota() {
+        live.poll(force: true)
         folder.poll(force: true); quota.poll(force: true); codex.poll(force: true)
         var lines: [String] = [], resets: [String] = [], notes: [String] = []
         func cell(_ name: String, _ used: Double?, _ resetAt: Date?) -> String? {
@@ -1494,7 +1701,10 @@ final class Pet: NSObject {
                 if let fr, fr > Date() { resets.append("Claude \(resetText(fr).replacingOccurrences(of: "今天 ", with: ""))") }
             }
         }
-        if Prefs.useCodex {
+        if Prefs.useClaude, Prefs.liveClaude, let n = live.claudeNote { notes.append(n) }
+        if Prefs.useCodex, let c = folder.freshCodex {
+            addFolder(c)
+        } else if Prefs.useCodex {
             if codex.five == nil && codex.week == nil {
                 notes.append("Codex：还没读到，用一次 Codex 就有了。")
             } else {
@@ -1505,10 +1715,10 @@ final class Pet: NSObject {
         }
         let muted = Set(Prefs.mutedSources)
         for src in folder.sources.values.sorted(by: { $0.name < $1.name })
-        where src.name.lowercased() != "claude" && !muted.contains(src.name) { addFolder(src) }
+        where !["claude", "codex"].contains(src.name.lowercased()) && !muted.contains(src.name) { addFolder(src) }
         if lines.isEmpty && notes.isEmpty { say("额度来源都关掉啦，在右键菜单“额度来源”里打开。", seconds: 5, force: true); return }
         if !resets.isEmpty { lines.append("最近重置：" + resets.joined(separator: "，")) }
-        if let at = codex.seenAt, Prefs.useCodex, Date().timeIntervalSince(at) > 3600 { lines.append("（Codex 是\(agoText(at))的数据）") }
+        if let at = codex.seenAt, Prefs.useCodex, folder.freshCodex == nil, Date().timeIntervalSince(at) > 3600 { lines.append("（Codex 是\(agoText(at))的数据）") }
         hop(6)
         say((lines + notes).joined(separator: "\n"), title: "已用额度", seconds: 9, quota: true)
     }
@@ -1540,7 +1750,18 @@ final class Pet: NSObject {
         m.addItem(submenu("额度来源", [
             ActionItem("Claude", on: Prefs.useClaude) { Prefs.useClaude.toggle() },
             ActionItem("Codex", on: Prefs.useCodex) { [weak self] in Prefs.useCodex.toggle(); self?.codex.poll(force: true) },
-        ] + folder.sources.values.map(\.name).filter { $0.lowercased() != "claude" }.sorted().map { name in
+        ] + [NSMenuItem.separator(),
+             ActionItem("实时查询 Claude（读本机登录信息）", on: Prefs.liveClaude) { [weak self] in
+                 Prefs.liveClaude.toggle()
+                 if Prefs.liveClaude { self?.live.poll(force: true) }
+                 self?.say(Prefs.liveClaude ? "好，每 5 分钟帮你看一次 Claude 额度。\n第一次系统会问能不能读钥匙串，点“始终允许”。"
+                                            : "好，Claude 额度只在用 Claude Code 时更新。", seconds: 6, force: true)
+             },
+             ActionItem("实时查询 Codex", on: Prefs.liveCodex) { [weak self] in
+                 Prefs.liveCodex.toggle(); if Prefs.liveCodex { self?.live.poll(force: true) }
+             },
+             NSMenuItem.separator(),
+        ] + folder.sources.values.map(\.name).filter { !["claude", "codex"].contains($0.lowercased()) }.sorted().map { name in
             ActionItem(name, on: !Prefs.mutedSources.contains(name)) {
                 var m = Prefs.mutedSources
                 if let i = m.firstIndex(of: name) { m.remove(at: i) } else { m.append(name) }
@@ -1631,6 +1852,7 @@ final class Pet: NSObject {
         case "studydone": studyEnd = Date(); tick()
         case "codexpoll": codex.poll()
         case "folderpoll": folder.poll()
+        case "livepoll": live.poll(force: true)
         case "hop": hop()
         case "spin": spin(); DispatchQueue.main.asyncAfter(deadline: .now() + 0.675) { self.burst() }
         case "fidget": fidget()
@@ -1668,7 +1890,7 @@ final class Pet: NSObject {
               let dest = CGImageDestinationCreateWithURL(URL(fileURLWithPath: path) as CFURL, "public.png" as CFString, 1, nil) else { return }
         CGImageDestinationAddImage(dest, img, nil)
         CGImageDestinationFinalize(dest)
-        let info = "frame=\(window.frame) visible=\(window.isVisible) ignores=\(window.ignoresMouseEvents) outfit=\(outfit) mode=\(mode) codex5=\(codex.five?.used ?? -1) codexWeek=\(codex.week?.used ?? -1)"
+        let info = "frame=\(window.frame) visible=\(window.isVisible) ignores=\(window.ignoresMouseEvents) outfit=\(outfit) mode=\(mode) codex5=\(codex.five?.used ?? -1) codexWeek=\(codex.week?.used ?? -1) claudeNote=\(live.claudeNote ?? "-") codexNote=\(live.codexNote ?? "-") sources=\(folder.sources.values.map { "\($0.name):" + $0.windows.map { "\($0.label)=\(pct($0.used))" }.joined(separator: ",") }.sorted())"
         try? info.write(toFile: path + ".txt", atomically: true, encoding: .utf8)
     }
 }

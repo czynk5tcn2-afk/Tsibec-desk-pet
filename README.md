@@ -13,7 +13,7 @@ Mac 桌面上的二次元桌宠：她站在你的桌面上陪你学习，顺便�
 - **互动**：单击打招呼或摸头；右键菜单里可以喂蛋糕、一起看书、小睡。
 - **一起学习**：番茄钟 25 / 50 分钟，她捧着书陪你，时间到了提醒你休息，还记着今天学了几轮。
 - **作息**：早上换常服、晚上换睡衣（时间可调），换的时候会转一圈；午后或深夜很久没理她，她会自己睡着。
-- **额度提醒**：Claude、Codex 的 5 小时 / 每周额度一变就冒气泡；右键“看看额度”一眼看全。
+- **额度提醒**：Claude、Codex 的 5 小时 / 每周额度一变就冒气泡；右键“看看额度”一眼看全。Codex 每 5 分钟主动查一次，不用开着对话也是实时的。
 - 内存约 20MB，CPU 不到 1%（动画在显卡上跑）。右键菜单还有“省电模式”。
 
 ## 安装（从源码编译）
@@ -30,12 +30,15 @@ cd Tsibec-desk-pet
 
 ## 额度从哪来
 
-全部只读你自己电脑上的文件：**不联网、不读登录信息、不上传任何东西**。
+默认只读你自己电脑上的文件，外加问一下本机的 Codex 程序；**不上传任何东西**。要读登录信息的那一项默认关着，你自己打开才会用。
 
 | 来源 | 怎么接 | 前提 |
 |---|---|---|
-| **Codex** | 自动。读 Codex 自己写在 `~/.codex/sessions/` 里的对话记录 | 用过一次 Codex |
-| **Claude** | 在 `~/.claude/settings.json` 里加 `"statusLine": {"type": "command", "command": "/你的路径/Tsibec-desk-pet/extras/claude-statusline.sh"}` | Claude Pro / Max 订阅；新开会话、回答过一次后才有数据；需要 `jq`（macOS 自带） |
+| **Codex（实时）** | 自动。每 5 分钟运行一次本机的 `codex app-server`，问它当前额度（不耗额度、不碰登录信息）；右键“额度来源”可关 | 装了 Codex 命令行或 ChatGPT 桌面版 |
+| **Codex（对话记录）** | 自动。读 Codex 自己写在 `~/.codex/sessions/` 里的记录，上面那项查不到时用它 | 用过一次 Codex |
+| **Claude（状态栏脚本）** | 在 `~/.claude/settings.json` 里加 `"statusLine": {"type": "command", "command": "/你的路径/Tsibec-desk-pet/extras/claude-statusline.sh"}` | Claude Pro / Max 订阅、用终端版 Claude Code；新开会话、回答过一次后才有数据；需要 `jq` |
+| **Claude（Claude Usage Tracker）** | 自动。装开源应用 [Claude Usage Tracker](https://github.com/hamed-elfayome/Claude-Usage-Tracker) 并打开它的 Statusline 功能，桌宠读它写的 `~/.claude/.statusline-usage-cache`（只有数字，不含登录信息） | 适合只用 Claude 桌面版的人 |
+| **Claude（实时查询，默认关）** | 右键 → 额度来源 → 实时查询 Claude。会读本机 Claude Code 的登录信息（钥匙串或 `~/.claude/.credentials.json`），每 5 分钟问一次 Claude 的用量接口 | 在这台电脑上登录过 Claude Code。**这个接口官方没公开说明**，随时可能改；介意的话别开 |
 | **其它任何工具** | 往 `~/.pet-quota/名字.json` 写一个小文件，见 [docs/额度来源.md](docs/额度来源.md) | 那个工具能拿到用量数字 |
 
 想接豆包、Kimi 之类的：把 [docs/额度来源.md](docs/额度来源.md) 发给你的 AI，说“帮我把 XX 的额度接到桌宠上”。文档本来就是写给 AI 看的，不用改桌宠代码。
